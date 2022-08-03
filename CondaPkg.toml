@@ -1,0 +1,10 @@
+[deps]
+cudnn = ""
+typing_extensions = ""
+cudatoolkit = ""
+nccl = ""
+cutensor = ""
+absl-py = ""
+numpy = ""
+scipy = "==1.7.3"
+opt_einsum = ""
