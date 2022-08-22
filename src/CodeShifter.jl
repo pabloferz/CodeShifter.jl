@@ -51,21 +51,37 @@ end
 
 # ## Public interface
 
-# The next two methods need to be implemented for user defined `TransformContext`s.
-
+# The next three methods need to be implemented for user defined `TransformContext`s.
+function process_inputs end
+function is_primitive end
 function transform! end
-
-process_inputs(::Type{BaseContext}, Args...) = Args
 
 function signature(::Type{C}, @ns(T::Type{F}), @ns(Args...)) where {C, F}
     return _to_tuple(F, process_inputs(C, Args...)...)
 end
 
 function code_info(::Type{C}, sig, method_instance) where {C, F}
+    ci = retrieve_code_info(method_instance)
     if is_primitive(C, sig.parameters...)
-        return retrieve_code_info(method_instance)
+        return primitive_code_info!(ci)
     end
-    return retrieve_code_info(method_instance)
+    return ci
+end
+
+function primitive_code_info!(ci)
+    meth = ci.parent.def
+    nargs = meth.nargs
+    f = getproperty(meth.module, meth.name)
+    ci.code = [
+        Expr(:call, f, (SlotNumber(i) for i = 2:nargs)...),
+        ReturnNode(SSAValue(1))
+    ]
+    ci.codelocs = UInt32[0, 0]
+    empty!(ci.linetable)
+    deleteat!(ci.slotflags, (nargs + 1):length(ci.slotflags))
+    deleteat!(ci.slotnames, (nargs + 1):length(ci.slotnames))
+    ci.ssavaluetypes = 1
+    return ci
 end
 
 """
@@ -79,18 +95,21 @@ function transform_code_info(@ns(ft::FunTransform), @ns(args...); show_reference
     return transform_generator(typeof(ft), args; show_reference)
 end
 
+process_inputs(::Type{BaseContext}, Args...) = Args
+is_primitive(::Type{BaseContext}, Args...) = false
+
 # ## Internals
 
 function transform_generator(
     @ns(ft::Type{FunTransform{T, F}}), @ns(args); show_reference = false
 ) where {T, F}
-    sigctx = T === Tuple{} ? BaseContext : last(T.parameters)
+    SigCtx = T === Tuple{} ? BaseContext : last(T.parameters)
     sig = signature(BaseContext, F, args...)
     methods = Base._methods_by_ftype(sig, -1, typemax(UInt))
     match = only(methods)
 
     mi = specialize_method(match)
-    ci₀ = retrieve_code_info(mi)
+    ci₀ = code_info(SigCtx, sig, mi)
 
     show_reference && println(ci₀)
 

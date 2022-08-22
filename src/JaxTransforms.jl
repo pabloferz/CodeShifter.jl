@@ -32,8 +32,6 @@ const IRTag = Union{SlotNumber, SSAValue}
 
 # TODO:
 #
-# - [ ] CodeShifter: Define a fallback `is_primitive`
-# - [ ] CodeShifter: Wrap `retrieve_code_info` to take primitives into account
 # - [ ] Leverage basic blocks info (iterate over blocks then over statements)
 # - [ ] Leverage reachability analysis tags
 # - [ ] Operate over a separate collection of transforms for reachable statements
