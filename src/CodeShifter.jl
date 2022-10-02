@@ -62,9 +62,11 @@ end
 
 function code_info(::Type{C}, sig, method_instance) where {C, F}
     ci = retrieve_code_info(method_instance)
+    ci === nothing && throw("Cannot transform builtin function $(method_instance.def.name)")
     if is_primitive(C, sig.parameters...)
         return primitive_code_info!(ci)
     end
+    empty!(ci.linetable)
     return ci
 end
 
@@ -109,11 +111,10 @@ function transform_generator(
     match = only(methods)
 
     mi = specialize_method(match)
-    ci₀ = code_info(SigCtx, sig, mi)
+    ci = code_info(SigCtx, sig, mi)
 
-    show_reference && println(ci₀)
+    show_reference && println(ci)
 
-    ci = copy(ci₀)
     if isdefined(ci, :edges)
         ci.edges = MethodInstance[mi]
     end
@@ -133,22 +134,38 @@ function prune_contexts(list)
 end
 
 function transform!(::BaseContext, ci, meth, nargs, offset, sparams)
+    code = Any[]
+    ssa_mapping = Int[]
+
     if meth.isva
-        pushfirst!(ci.code, mkarg(Base.rest, 2, meth.nargs - 1))
-        prepend!(ci.code, (mkarg(getfield, 2, i) for i = 1:meth.nargs-2))
+        pushfirst!(code, mkarg(Base.rest, 2, meth.nargs, meth.nargs - 1))
+        prepend!(code, (mkarg(getfield, 2, meth.nargs, i) for i = 1:meth.nargs-2))
         nargs = meth.nargs
     else
-        prepend!(ci.code, (mkarg(getfield, 2, i) for i = 1:nargs-1))
+        prepend!(code, (mkarg(getfield, 2, nargs, i) for i = 1:nargs-1))
     end
-    pushfirst!(ci.code, mkarg(getproperty, 1, quoted(:f)))
-    prepend!(ci.codelocs, (0 for i = 1:nargs))
+    pushfirst!(code, Expr(:call, getproperty, SlotNumber(1), quoted(:f)))
+    ci.codelocs = UInt32[0 for i = 1:nargs]
     prepend!(ci.ssaflags, (0x00 for i = 1:nargs))
-    ci.ssavaluetypes += nargs
-    tags_map = Dict{IRTag, IRTag}(SlotNumber(i) => SSAValue(i) for i in 1:nargs)
-    for id = (nargs+1:length(ci.code))
-        ci.code[id] = transform_stmt(ci.code[id], tags_map, nargs, sparams)
+    tags_map = Dict{IRTag, IRTag}(SlotNumber(i) => SlotNumber(i + 1) for i in 1:nargs)
+    shift = -nargs
+    for (id, stmt) in enumerate(ci.code)
+        stmt = transform_stmt(stmt, id, tags_map, nargs, sparams)
+        push!(ssa_mapping, id - shift)
+        if (stmt isa NewvarNode || stmt isa SlotNumber)
+            shift += 1
+            continue
+        end
+        push!(code, stmt)
     end
-    local_slots = length(tags_map) - nargs
+    for (id, stmt) in enumerate(code)
+        if stmt isa GotoIfNot
+            code[id] = GotoIfNot(stmt.cond, ssa_mapping[stmt.dest - nargs])
+        elseif stmt isa GotoNode
+            code[id] = GotoNode(ssa_mapping[stmt.label - nargs])
+        end
+    end
+    local_slots = maximum(sn.id for sn in values(tags_map) if sn isa SlotNumber) - nargs
     ci.slotnames = Symbol[
         Symbol("#self#"), :args,
         (Symbol(:a, i) for i = 1:nargs-2)...,
@@ -160,18 +177,28 @@ function transform!(::BaseContext, ci, meth, nargs, offset, sparams)
         (0x08 for i = 1:local_slots)...,
     ]
     ci.slottypes = Any[FunTransform, Any]
+    ci.ssavaluetypes = length(code)
+    append!(ci.codelocs, (0 for i = 1:length(code)))
+    ci.code = code
     return ci, nargs, offset
 end
 
-mkarg(getf, n, p) = Expr(:call, getf, SlotNumber(n), p)
+mkarg(getf, n, o, p) = Expr(:(=), SlotNumber(o + p), Expr(:call, getf, SlotNumber(n), p))
 
-function transform_stmt(stmt, tags_map, offset, sparams)
-    transform(stmt) = transform_stmt(stmt, tags_map, offset, sparams)
+function transform_stmt(stmt, id, tags_map, offset, sparams; inner = false)
+    transform(stmt) = transform_stmt(stmt, id, tags_map, offset, sparams; inner = true)
     if isexpr(stmt, :(=))
         key = stmt.args[1]
         args = Tuple(transform(s) for s in @view stmt.args[2:end])
-        sn = haskey(tags_map, key) ? tags_map[key] : push_tag!(tags_map, key)
+        sn = push_tag!(tags_map, key)
         return Expr(:(=), sn, args...)
+    elseif !inner && isexpr(stmt, :call)
+        ex = Expr(:call, map(transform, stmt.args)...)
+        if ex.args[1] === throw
+            return ex
+        end
+        sn = push_tag!(tags_map, SSAValue(id))
+        return Expr(:(=), sn, ex)
     elseif isexpr(stmt, :static_parameter)
         return quoted(sparams[stmt.args[1]])
     elseif isa(stmt, Expr)
@@ -179,11 +206,15 @@ function transform_stmt(stmt, tags_map, offset, sparams)
     elseif isa(stmt, GlobalRef)
         return getproperty(stmt.mod, stmt.name)
     elseif isa(stmt, SlotNumber)
-        return tags_map[stmt]
+        if inner
+            return tags_map[stmt]
+        else
+            return tags_map[SSAValue(id)] = tags_map[stmt]
+        end
     elseif isa(stmt, SSAValue)
-        return SSAValue(stmt.id + offset)
+        return haskey(tags_map, stmt) ? tags_map[stmt] : push_tag!(tags_map, stmt)
     elseif isa(stmt, NewvarNode)
-        return NewvarNode(push_tag!(tags_map, stmt.slot))
+        return stmt
     elseif isa(stmt, GotoIfNot)
         return GotoIfNot(transform(stmt.cond), stmt.dest + offset)
     elseif isa(stmt, GotoNode)
@@ -193,12 +224,12 @@ function transform_stmt(stmt, tags_map, offset, sparams)
     elseif isa(stmt, QuoteNode)
         return stmt.value
     else
-        return stmt
+        stmt
     end
 end
 
 function push_tag!(tags_map, key)
-    sn = SlotNumber(length(tags_map) + 1)
+    sn = SlotNumber(maximum(sn.id for sn in values(tags_map) if sn isa SlotNumber) + 1)
     tags_map[key] = sn
     return sn
 end
