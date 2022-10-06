@@ -5,33 +5,37 @@ using ChainRules
 using ChainRulesCore
 using LinearAlgebra
 
+include("CodeShifter.jl")
+
 import Core: GlobalRef, Typeof
+import .CodeShifter: kCallOnlyPrimitives
 
 
-export c_InactivePrimitives
+export kInactivePrimitives
 export partial_eval, primals_from_pvals, tangents_from_pvals, tdot
 
 
-const c_InactivePrimitives = Set([
-    Base.CoreLogging.logmsg_code,
-    Base.CoreLogging.shouldlog,
-    Base.to_tuple_type,
-    Base.methods,
-    Base.println,
-    Base.print,
-    Base.show,
-    Base.flush,
-    Base.string,
-    Base.print_to_string,
-    Base.Threads.threadid,
-    Base.Threads.nthreads,
-    Base.eps,
-    Base.nextfloat,
-    Base.prevfloat,
-    Core.kwfunc,
-])
+const kInactivePrimitives = union!(
+    Set([
+        Base.CoreLogging.logmsg_code,
+        Base.CoreLogging.shouldlog,
+        Base.Threads.threadid,
+        Base.Threads.nthreads,
+        Base.eps,
+        Base.methods,
+        Base.nextfloat,
+        Base.prevfloat,
+        Base.print_to_string,
+        Base.string,
+        Base.to_tuple_type,
+        Core.kwfunc,
+    ]),
+    kCallOnlyPrimitives
+)
 
-const c_Primitives = Set{Function}()
+# This is not the right way store the rules.
+# In principle, we should store the rules per method and not per function.
+const kJVPRules = Dict{Function, Function}()
 
 
 function partial_eval end
@@ -48,7 +52,7 @@ function tdot(t::Tuple{NoTangent, Any, Any}, t_in)
 end
 
 
-macro frule(call, tangent_call, setup...)
+macro jvprule(call, tangent_call, setup...)
     f = esc(call.args[1])
     inputs = esc.(call.args[2:end])
 
@@ -62,105 +66,96 @@ macro frule(call, tangent_call, setup...)
         primals_result = Expr(:call, f, inputs...)
     end
 
-    peval_expr = quote
-        ForwardRules.partial_eval(::Typeof($f), $(inputs...)) = $peval_body
-    end
+    ins = call.args[2:end]
+    primals_in = length(ins) == 1 ? only(ins) : :primals_in
+    primal_peval = length(ins) == 1 ? () : Expr(:(=), Expr(:tuple, ins...), :primals_in)
 
-    tangents_expr = quote
-        function ForwardRules.tangents_from_pvals(::Typeof($f), $(esc(:args)))
-            $unpacking_stmt
-            return (NoTangent(), ($(esc(tangent_call))))
+    tmp_ex = quote
+        function tmp_rule($primals_in, tangents_in)
+            $primal_peval
+            primals_out = $call
+            ptangents = $tangent_call
+            tangents_out = ptangents * tangents_in
+            return primals_out, tangents_out
         end
     end
 
-    primals_expr = quote
-        function ForwardRules.primals_from_pvals(::Typeof($f), $(esc(:args)))
-            $unpacking_stmt
-            return $primals_result
-        end
-    end
-
-    return quote
-        $(peval_expr)
-        $(tangents_expr)
-        $(primals_expr)
-    end
+    return nothing
 end
 
 
-@frule one(x)   zero(x)
-@frule zero(x)  zero(x)
+@jvprule one(x)   zero(x)
+@jvprule zero(x)  zero(x)
 
-@frule acosh(x)        inv(sqrt(x - 1) * sqrt(x + 1))
-@frule acoth(x)        inv(1 - x ^ 2)
-@frule acsch(x)        -(inv(x ^ 2 * sqrt(1 + x ^ -2)))
-@frule acsch(x::Real)  -(inv(abs(x) * sqrt(1 + x ^ 2)))
-@frule asech(x)        -(inv(x * sqrt(1 - x ^ 2)))
-@frule asinh(x)        inv(sqrt(x ^ 2 + 1))
-@frule atanh(x)        inv(1 - x ^ 2)
+@jvprule acosh(x)        inv(sqrt(x ^ 2 - 1))
+@jvprule acoth(x)        inv(1 - x ^ 2)
+@jvprule acsch(x)        -(inv(x ^ 2 * sqrt(1 + x ^ -2)))
+@jvprule acsch(x::Real)  -(inv(abs(x) * sqrt(1 + x ^ 2)))
+@jvprule asech(x)        -(inv(x * sqrt(1 - x ^ 2)))
+@jvprule asinh(x)        inv(sqrt(x ^ 2 + 1))
+@jvprule atanh(x)        inv(1 - x ^ 2)
 
-@frule acosd(x)        -inv(deg2rad(sqrt(1 - x ^ 2)))
-@frule acotd(x)        -inv(deg2rad(1 + x ^ 2))
-@frule acscd(x)        -inv(deg2rad(x^2 * sqrt(1 - x ^ -2)))
-@frule acscd(x::Real)  -inv(deg2rad(abs(x) * sqrt(x ^ 2 - 1)))
-@frule asecd(x)        inv(deg2rad(x ^ 2 * sqrt(1 - x ^ -2)))
-@frule asecd(x::Real)  inv(deg2rad(abs(x) * sqrt(x ^ 2 - 1)))
-@frule asind(x)        inv(deg2rad(sqrt(1 - x ^ 2)))
-@frule atand(x)        inv(deg2rad(1 + x ^ 2))
+@jvprule acosd(x)        -inv(deg2rad(sqrt(1 - x ^ 2)))
+@jvprule acotd(x)        -inv(deg2rad(1 + x ^ 2))
+@jvprule acscd(x)        -inv(deg2rad(x^2 * sqrt(1 - x ^ -2)))
+@jvprule acscd(x::Real)  -inv(deg2rad(abs(x) * sqrt(x ^ 2 - 1)))
+@jvprule asecd(x)        inv(deg2rad(x ^ 2 * sqrt(1 - x ^ -2)))
+@jvprule asecd(x::Real)  inv(deg2rad(abs(x) * sqrt(x ^ 2 - 1)))
+@jvprule asind(x)        inv(deg2rad(sqrt(1 - x ^ 2)))
+@jvprule atand(x)        inv(deg2rad(1 + x ^ 2))
 
-@frule cot(x)   -((1 + Ω ^ 2))         peval=true
-@frule cotd(x)  -deg2rad(1 + Ω ^ 2)    peval=true
-@frule coth(x)  -(csch(x) ^ 2)
-@frule csc(x)   -Ω * cot(x)            peval=true
-@frule cscd(x)  -deg2rad(Ω * cotd(x))  peval=true
-@frule csch(x)  -(coth(x)) * Ω         peval=true
-@frule sec(x)   Ω * tan(x)             peval=true
-@frule secd(x)  deg2rad(Ω * tand(x))   peval=true
-@frule sech(x)  -(tanh(x)) * Ω         peval=true
+@jvprule cot(x)   -((1 + Ω ^ 2))         peval=true
+@jvprule cotd(x)  -deg2rad(1 + Ω ^ 2)    peval=true
+@jvprule coth(x)  -(csch(x) ^ 2)
+@jvprule csc(x)   -Ω * cot(x)            peval=true
+@jvprule cscd(x)  -deg2rad(Ω * cotd(x))  peval=true
+@jvprule csch(x)  -(coth(x)) * Ω         peval=true
+@jvprule sec(x)   Ω * tan(x)             peval=true
+@jvprule secd(x)  deg2rad(Ω * tand(x))   peval=true
+@jvprule sech(x)  -(tanh(x)) * Ω         peval=true
 
-@frule acot(x)        -(inv(1 + x ^ 2))
-@frule acsc(x)        -(inv(x ^ 2 * sqrt(1 - x ^ -2)))
-@frule acsc(x::Real)  -(inv(abs(x) * sqrt(x ^ 2 - 1)))
-@frule asec(x)        inv(x ^ 2 * sqrt(1 - x ^ -2))
-@frule asec(x::Real)  inv(abs(x) * sqrt(x ^ 2 - 1))
+@jvprule acot(x)        -(inv(1 + x ^ 2))
+@jvprule acsc(x)        -(inv(x ^ 2 * sqrt(1 - x ^ -2)))
+@jvprule acsc(x::Real)  -(inv(abs(x) * sqrt(x ^ 2 - 1)))
+@jvprule asec(x)        inv(x ^ 2 * sqrt(1 - x ^ -2))
+@jvprule asec(x::Real)  inv(abs(x) * sqrt(x ^ 2 - 1))
 
-@frule cosd(x)   -deg2rad(sind(x))
-@frule cospi(x)  -π * sinpi(x)
-@frule sind(x)   deg2rad(cosd(x))
-@frule sinpi(x)  π * cospi(x)
-@frule tand(x)   deg2rad(1 + Ω ^ 2)  peval=true
+@jvprule cosd(x)   -deg2rad(sind(x))
+@jvprule cospi(x)  -π * sinpi(x)
+@jvprule sind(x)   deg2rad(cosd(x))
+@jvprule sinpi(x)  π * cospi(x)
+@jvprule tand(x)   deg2rad(1 + Ω ^ 2)  peval=true
 
-
-@frule sin(x)  cos(x)
-@frule cos(x)  -sin(x)
-@frule tan(x)  1 + Ω ^ 2  peval=true
+# @jvprule sin(x)  cos(x)
+# @jvprule cos(x)  -sin(x)
+# @jvprule tan(x)  1 + Ω ^ 2  peval=true
 
 # Trig-Hyperbolic
-@frule cosh(x)  sinh(x)
-@frule sinh(x)  cosh(x)
-@frule tanh(x)  1 - Ω ^ 2  peval=true
+@jvprule cosh(x)  sinh(x)
+@jvprule sinh(x)  cosh(x)
+@jvprule tanh(x)  1 - Ω ^ 2  peval=true
 
 # Trig- Inverses
-@frule acos(x)  -(inv(sqrt(1 - x ^ 2)))
-@frule asin(x)  inv(sqrt(1 - x ^ 2))
-@frule atan(x)  inv(1 + x ^ 2)
+@jvprule acos(x)  -(inv(sqrt(1 - x ^ 2)))
+@jvprule asin(x)  inv(sqrt(1 - x ^ 2))
+@jvprule atan(x)  inv(1 + x ^ 2)
 
 # Trig-Multivariate
-# @frule atan(y, x) @setup(u = x ^ 2 + y ^ 2) (x / u, -y / u)
-# @frule sincos(x) @setup((sinx, cosx) = Ω) cosx -sinx
+# @jvprule atan(y, x) @setup(u = x ^ 2 + y ^ 2) (x / u, -y / u)
+# @jvprule sincos(x) @setup((sinx, cosx) = Ω) cosx -sinx
 
 # exponents
-@frule cbrt(x)   inv(3 * Ω ^ 2)          peval=true
-@frule inv(x)    -(Ω ^ 2)                peval=true
-@frule sqrt(x)   inv(2Ω)                 peval=true
-@frule exp(x)    Ω                       peval=true
-@frule exp10(x)  Ω * log(oftype(x, 10))  peval=true
-@frule exp2(x)   Ω * log(oftype(x, 2))   peval=true
-@frule expm1(x)  exp(x)
-@frule log(x)    inv(x)
-@frule log10(x)  inv(x) / log(oftype(x, 10))
-@frule log1p(x)  inv(x + 1)
-@frule log2(x)   inv(x) / log(oftype(x, 2))
+@jvprule cbrt(x)   inv(3 * Ω ^ 2)          peval=true
+@jvprule inv(x)    -(Ω ^ 2)                peval=true
+@jvprule sqrt(x)   inv(2Ω)                 peval=true
+@jvprule exp(x)    Ω                       peval=true
+@jvprule exp10(x)  Ω * log(oftype(x, 10))  peval=true
+@jvprule exp2(x)   Ω * log(oftype(x, 2))   peval=true
+@jvprule expm1(x)  exp(x)
+@jvprule log(x)    inv(x)
+@jvprule log10(x)  inv(x) / log(oftype(x, 10))
+@jvprule log1p(x)  inv(x + 1)
+@jvprule log2(x)   inv(x) / log(oftype(x, 2))
 
 
 end  # module ForwardRules
