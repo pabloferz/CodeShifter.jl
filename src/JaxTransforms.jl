@@ -15,7 +15,7 @@ import Core: ReturnNode, SlotNumber, SSAValue
 import .CodeShifter:
     @ns, FunTransform, TransformContext,
     is_primitive, process_inputs, transform!
-import .ForwardRules: c_InactivePrimitives
+import .ForwardRules: kInactivePrimitives
 
 
 # Type definitions
@@ -48,8 +48,8 @@ function is_primitive(::Type{JVP}, F, Args...)
     return T !== Nothing && !(T <: Tuple{Any, NoTangent})
 end
 
-function transform!(::JVP, ci, meth, nargs, offset, sparams)
-    code = Any[]
+function transform!(::JVP, ci, code, meth, nargs, sparams)
+    empty!(code)
     ssa_mapping = Int[]
 
     function emit!(stmt)
@@ -73,9 +73,8 @@ function transform!(::JVP, ci, meth, nargs, offset, sparams)
         end
     end
 
-    ci.code = code
-    # insert!(ci.code, 2, Expr(:(=), SlotNumber(4), Expr(:call, getfield, SlotNumber(2), 2)))
-    # insert!(ci.code, 2, Expr(:(=), SlotNumber(3), Expr(:call, getfield, SlotNumber(2), 1)))
+    # insert!(code, 2, Expr(:(=), SlotNumber(4), Expr(:call, getfield, SlotNumber(2), 2)))
+    # insert!(code, 2, Expr(:(=), SlotNumber(3), Expr(:call, getfield, SlotNumber(2), 1)))
 
     # insert!(ci.slotnames, 3, :tangents)
     # insert!(ci.slotnames, 3, :primals)
@@ -83,7 +82,8 @@ function transform!(::JVP, ci, meth, nargs, offset, sparams)
     # insert!(ci.slotflags, 3, 0x00)
     # insert!(ci.slotflags, 3, 0x00)
 
-    return ci, nargs, offset + 1
+    ci.code, code = code, ci.code
+    return ci, code, nargs
 end
 
 function transformable_ids(code, nargs)
@@ -112,7 +112,9 @@ function collect_tags_rev!(ids_set, stmt, id)
 end
 
 function collect_tags_fwd!(ids_set, stmt, id)
-    if isa(stmt, IRTag) && stmt in ids_set
+    if isa(stmt, ReturnNode) && stmt.val in ids_set
+        push!(ids_set, SSAValue(id))
+    elseif isa(stmt, IRTag) && stmt in ids_set
         push!(ids_set, SSAValue(id))
     elseif isexpr(stmt, :call) && !(stmt.args[1] in c_InactivePrimitives)
         ind = isa(stmt.args[1], IRTag) ? 1 : 2
