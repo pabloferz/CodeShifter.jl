@@ -23,6 +23,15 @@ const var"@ns" = var"@nospecialize"
 export FunTransform, TransformContext, process_inputs, transform!
 
 
+const kCallOnlyPrimitives = Set([
+    Base.flush,
+    Base.print,
+    Base.println,
+    Base.show,
+    Core.throw,
+])
+
+
 # Type definitions
 # ================
 
@@ -60,7 +69,7 @@ function signature(::Type{C}, @ns(T::Type{F}), @ns(Args...)) where {C, F}
     return _to_tuple(F, process_inputs(C, Args...)...)
 end
 
-function code_info(::Type{C}, sig, method_instance) where {C, F}
+function code_info(::Type{C}, sig, method_instance) where {C}
     ci = retrieve_code_info(method_instance)
     ci === nothing && throw("Cannot transform builtin function $(method_instance.def.name)")
     if is_primitive(C, sig.parameters...)
@@ -119,10 +128,10 @@ function transform_generator(
         ci.edges = MethodInstance[mi]
     end
 
-    offset = 1
+    code = Any[]
     nargs = length(sig.parameters)
     for ctx in prune_contexts(T === Tuple ? Core.svec() : T.parameters)
-        ci, nargs, offset = transform!(ctx, ci, mi.def, nargs, offset, match.sparams)
+        ci, code, nargs = transform!(ctx, ci, code, mi.def, nargs, match.sparams)
     end
 
     return ci
@@ -133,8 +142,8 @@ function prune_contexts(list)
     return (BaseContext(), (list[i]() for i = revinds if list[i] !== BaseContext)...)
 end
 
-function transform!(::BaseContext, ci, meth, nargs, offset, sparams)
-    code = Any[]
+function transform!(::BaseContext, ci, code, meth, nargs, sparams)
+    empty!(code)
     ssa_mapping = Int[]
 
     if meth.isva
@@ -144,25 +153,26 @@ function transform!(::BaseContext, ci, meth, nargs, offset, sparams)
     else
         prepend!(code, (mkarg(getfield, 2, nargs, i) for i = 1:nargs-1))
     end
+
     pushfirst!(code, Expr(:call, getproperty, SlotNumber(1), quoted(:f)))
     ci.codelocs = UInt32[0 for i = 1:nargs]
     prepend!(ci.ssaflags, (0x00 for i = 1:nargs))
     tags_map = Dict{IRTag, IRTag}(SlotNumber(i) => SlotNumber(i + 1) for i in 1:nargs)
-    shift = -nargs
+    offset = nargs
     for (id, stmt) in enumerate(ci.code)
-        stmt = transform_stmt(stmt, id, tags_map, nargs, sparams)
-        push!(ssa_mapping, id - shift)
+        stmt = transform_stmt(stmt, id, tags_map, sparams)
+        push!(ssa_mapping, id + offset)
         if (stmt isa NewvarNode || stmt isa SlotNumber)
-            shift += 1
+            offset -= 1
             continue
         end
         push!(code, stmt)
     end
     for (id, stmt) in enumerate(code)
         if stmt isa GotoIfNot
-            code[id] = GotoIfNot(stmt.cond, ssa_mapping[stmt.dest - nargs])
+            code[id] = GotoIfNot(stmt.cond, ssa_mapping[stmt.dest])
         elseif stmt isa GotoNode
-            code[id] = GotoNode(ssa_mapping[stmt.label - nargs])
+            code[id] = GotoNode(ssa_mapping[stmt.label])
         end
     end
     local_slots = maximum(sn.id for sn in values(tags_map) if sn isa SlotNumber) - nargs
@@ -179,14 +189,14 @@ function transform!(::BaseContext, ci, meth, nargs, offset, sparams)
     ci.slottypes = Any[FunTransform, Any]
     ci.ssavaluetypes = length(code)
     append!(ci.codelocs, (0 for i = 1:length(code)))
-    ci.code = code
-    return ci, nargs, offset
+    ci.code, code = code, ci.code
+    return ci, code, nargs
 end
 
 mkarg(getf, n, o, p) = Expr(:(=), SlotNumber(o + p), Expr(:call, getf, SlotNumber(n), p))
 
-function transform_stmt(stmt, id, tags_map, offset, sparams; inner = false)
-    transform(stmt) = transform_stmt(stmt, id, tags_map, offset, sparams; inner = true)
+function transform_stmt(stmt, id, tags_map, sparams; inner = false)
+    transform(stmt) = transform_stmt(stmt, id, tags_map, sparams; inner = true)
     if isexpr(stmt, :(=))
         key = stmt.args[1]
         args = Tuple(transform(s) for s in @view stmt.args[2:end])
@@ -194,7 +204,7 @@ function transform_stmt(stmt, id, tags_map, offset, sparams; inner = false)
         return Expr(:(=), sn, args...)
     elseif !inner && isexpr(stmt, :call)
         ex = Expr(:call, map(transform, stmt.args)...)
-        if ex.args[1] === throw
+        if ex.args[1] in kCallOnlyPrimitives
             return ex
         end
         sn = push_tag!(tags_map, SSAValue(id))
@@ -216,9 +226,9 @@ function transform_stmt(stmt, id, tags_map, offset, sparams; inner = false)
     elseif isa(stmt, NewvarNode)
         return stmt
     elseif isa(stmt, GotoIfNot)
-        return GotoIfNot(transform(stmt.cond), stmt.dest + offset)
+        return GotoIfNot(transform(stmt.cond), stmt.dest)
     elseif isa(stmt, GotoNode)
-        return GotoNode(stmt.label + offset)
+        return GotoNode(stmt.label)
     elseif isa(stmt, ReturnNode)
         return ReturnNode(transform(stmt.val))
     elseif isa(stmt, QuoteNode)
