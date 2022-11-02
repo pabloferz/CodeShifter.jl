@@ -195,7 +195,7 @@ end
 
 mkarg(getf, n, o, p) = Expr(:(=), SlotNumber(o + p), Expr(:call, getf, SlotNumber(n), p))
 
-function transform_stmt(stmt, id, tags_map, sparams; inner = false)
+function transform_stmt(@ns(stmt), id, tags_map, sparams; inner = false)
     transform(stmt) = transform_stmt(stmt, id, tags_map, sparams; inner = true)
     if isexpr(stmt, :(=))
         key = stmt.args[1]
