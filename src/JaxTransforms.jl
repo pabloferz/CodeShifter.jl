@@ -14,7 +14,7 @@ import Base.Meta: isexpr
 import Core: ReturnNode, SlotNumber, SSAValue
 import .CodeShifter:
     @ns, FunTransform, TransformContext,
-    is_primitive, process_inputs, transform!
+    is_primitive, mkarg, process_inputs, transform!
 import .ForwardRules: kInactivePrimitives
 
 
@@ -61,11 +61,15 @@ function transform!(::JVP, ci, code, meth, nargs, sparams)
 
     tags_set = transformable_ids(ci.code, nargs)
 
+    push!(code, ci.code[1])
     for i in 2:nargs
-        # ci.code[i] = Expr(:call, ci.code[i].args[1], SlotNumber(3), i - 1)
+        push!(code, mkarg(getfield, 3, nargs + 2, i - 1))
+    end
+    for i in 2:nargs
+        push!(code, mkarg(getfield, 4, 2nargs + 1, i - 1))
     end
 
-    for (id, stmt) in enumerate(ci.code)
+    for (id, stmt) in enumerate(@view ci.code[nargs+1:end])
         if SSAValue(id) in tags_set
             push!(code, stmt)
         else
@@ -73,14 +77,14 @@ function transform!(::JVP, ci, code, meth, nargs, sparams)
         end
     end
 
-    # insert!(code, 2, Expr(:(=), SlotNumber(4), Expr(:call, getfield, SlotNumber(2), 2)))
-    # insert!(code, 2, Expr(:(=), SlotNumber(3), Expr(:call, getfield, SlotNumber(2), 1)))
+    insert!(code, 2, Expr(:(=), SlotNumber(4), Expr(:call, getfield, SlotNumber(2), 2)))
+    insert!(code, 2, Expr(:(=), SlotNumber(3), Expr(:call, getfield, SlotNumber(2), 1)))
 
-    # insert!(ci.slotnames, 3, :tangents)
-    # insert!(ci.slotnames, 3, :primals)
+    insert!(ci.slotnames, 3, :tangents)
+    insert!(ci.slotnames, 3, :primals)
 
-    # insert!(ci.slotflags, 3, 0x00)
-    # insert!(ci.slotflags, 3, 0x00)
+    insert!(ci.slotflags, 3, 0x00)
+    insert!(ci.slotflags, 3, 0x00)
 
     ci.code, code = code, ci.code
     return ci, code, nargs
@@ -103,7 +107,7 @@ function collect_tags_rev!(ids_set, stmt, id)
         push!(ids_set, stmt.val)
     elseif isa(stmt, IRTag)
         push!(ids_set, stmt)
-    elseif isexpr(stmt, :call) && !(stmt.args[1] in c_InactivePrimitives)
+    elseif isexpr(stmt, :call) && !(stmt.args[1] in kInactivePrimitives)
         ind = isa(stmt.args[1], IRTag) ? 1 : 2
         foreach(stmt -> collect_tags_rev!(ids_set, stmt, id), @view stmt.args[ind:end])
     elseif isexpr(stmt, :(=)) && stmt.args[1] in ids_set
@@ -116,7 +120,7 @@ function collect_tags_fwd!(ids_set, stmt, id)
         push!(ids_set, SSAValue(id))
     elseif isa(stmt, IRTag) && stmt in ids_set
         push!(ids_set, SSAValue(id))
-    elseif isexpr(stmt, :call) && !(stmt.args[1] in c_InactivePrimitives)
+    elseif isexpr(stmt, :call) && !(stmt.args[1] in kInactivePrimitives)
         ind = isa(stmt.args[1], IRTag) ? 1 : 2
         for stmt in @view stmt.args[ind:end]
             collect_tags_fwd!(ids_set, stmt, id)

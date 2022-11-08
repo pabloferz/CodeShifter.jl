@@ -38,7 +38,7 @@ const kInactivePrimitives = union!(
 
 # This is not the right way store the rules.
 # In principle, we should store the rules per method and not per function.
-const kJVPRules = Dict{Symbol, Any}()
+const kJVPRules = Dict{Symbol, Function}()
 
 
 tdot(::NoTangent, t_in) = NoTangent()
@@ -79,28 +79,35 @@ macro jvprule(primal_call, tangent_call, setup...)
             $(unpack_primals...)
             $primal_call
             $tangent_call
-            ΔΩ = tdot(Ω̇, Δx)
+            ΔΩ = $tdot(Ω̇, Δx)
             return Ω, ΔΩ
         end
     end
 
-    rule = eval(ex)
-    ci = only(code_lowered(rule, (Nothing, Nothing)))
+    ci = only(Meta.lower(@__MODULE__, ex).args).code[end - 1].args[end]
 
-    rn = Ref(1)
+    rn = Ref(0)
     rule_code = Any[]
-    tags_map = Dict{IRTag, IRTag}()
+    tags_map = Dict{IRTag, Expr}()
 
     for (id, stmt) in enumerate(@view ci.code[1:end-2])
         new_stmt = transform_rule_stmt(stmt, id, rn, tags_map)
-        isa(new_stmt, SlotNumber) && continue
-        push!(rule_code, new_stmt)
+        isa(new_stmt, SlotNumber) || (isexpr(new_stmt, :call) && new_stmt.args[1] === SlotNumber) && continue
+        push!(rule_code, Expr(:call, :Expr, Expr(:quote, new_stmt.head), new_stmt.args...))
     end
 
-    kJVPRules[f] = rule_code
+    # sn_out = Tuple(tags_map[s].args[end] for s in @views(ci.code[end-1].args[2:end]))
+
+    kJVPRules[f] = eval(quote
+        $(gensym(:jvp_rule))(p::Int, t::Int) = Any[$(rule_code...)]
+        # $(Symbol("#", f, :_jvp))(p, t) = (Any[$(rule_code...)], $(sn_out...))
+    end)
 
     return :nothing
 end
+
+
+new_slot(n) = Expr(:call, SlotNumber, Expr(:call, +, :p, n))
 
 
 function transform_rule_stmt(@ns(stmt), id, rn, tags_map; inner = false)
@@ -111,23 +118,23 @@ function transform_rule_stmt(@ns(stmt), id, rn, tags_map; inner = false)
             return tags_map[key] = tags_map[stmt.args[2]]
         end
         args = Tuple(transform(s) for s in @view stmt.args[2:end])
-        sn = tags_map[key] = tags_map[SSAValue(id)] = SlotNumber(rn[] + 3)
+        sn = tags_map[key] = tags_map[SSAValue(id)] = new_slot(rn[] + 2)
         rn[] += 1
         return Expr(:(=), sn, args...)
     elseif !inner && isexpr(stmt, :call)
-        ex = Expr(:call, map(transform, stmt.args)...)
+        ex = Expr(:call, :Expr, :(:call), map(transform, stmt.args)...)
         if ex.args[1] in kCallOnlyPrimitives
             return ex
         end
-        sn = tags_map[SSAValue(id)] = SlotNumber(rn[] + 3)
+        sn = tags_map[SSAValue(id)] = new_slot(rn[] + 2)
         rn[] += 1
         return Expr(:(=), sn, ex)
     elseif isa(stmt, Expr)
-        return Expr(stmt.head, map(transform, stmt.args)...)
+        return Expr(:call, :Expr, Expr(:quote, stmt.head), map(transform, stmt.args)...)
     elseif isa(stmt, GlobalRef)
         return getproperty(stmt.mod, stmt.name)
     elseif isa(stmt, SlotNumber)
-        stmt.id in (2, 3) && return stmt
+        stmt.id in (2, 3) && return Expr(:call, SlotNumber, stmt.id == 2 ? :p : :t)
         if inner
             return tags_map[stmt]
         else
