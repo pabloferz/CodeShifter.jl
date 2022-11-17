@@ -1,4 +1,4 @@
-module ForwardRules
+module JVPRules
 
 
 using ChainRules
@@ -31,6 +31,7 @@ const kInactivePrimitives = union!(
         Base.print_to_string,
         Base.string,
         Base.to_tuple_type,
+        Core.apply_type,
         Core.kwfunc,
     ]),
     kCallOnlyPrimitives
@@ -40,10 +41,15 @@ const kInactivePrimitives = union!(
 # In principle, we should store the rules per method and not per function.
 const kJVPRules = Dict{Symbol, Function}()
 
+jvprule(args...) = nothing
+
 
 tdot(::NoTangent, t_in) = NoTangent()
 tdot(t, ::NoTangent) = NoTangent()
 tdot(t, t_in) = sum(a ⋅ b for (a, b) in zip(t, t_in))
+tdot(t::Real, t_in::Real) = t * t_in
+tdot(::Tuple{NoTangent}, t_in) = NoTangent()
+tdot(t, ::Tuple{NoTangent}) = NoTangent()
 tdot(t::Tuple{NoTangent, Any}, t_in) = tdot(last(t), last(t_in))
 function tdot(t::Tuple{NoTangent, Any, Any}, t_in)
     return tdot(Base.rest(t, 2), Base.rest(t_in, 2))
@@ -52,9 +58,15 @@ end
 
 getfield_expr(t, i) = Expr(:call, getfield, t, i)
 
+function to_type_assert(ex; default = :Number)
+    type = isexpr(ex, :(::)) ? last(ex.args) : default
+    return Expr(:(::), Expr(:curly, :Type, Expr(:<:, type)))
+end
+
 macro jvprule(primal_call, tangent_call, setup...)
     f = primal_call.args[1]
     inputs = @view primal_call.args[2:end]
+    types = map(to_type_assert, inputs)
     nargs = length(inputs)
 
     primals_in = nargs == 1 ? only(inputs) : :primals_in
@@ -96,18 +108,20 @@ macro jvprule(primal_call, tangent_call, setup...)
         push!(rule_code, Expr(:call, :Expr, Expr(:quote, new_stmt.head), new_stmt.args...))
     end
 
-    # sn_out = Tuple(tags_map[s].args[end] for s in @views(ci.code[end-1].args[2:end]))
+    sn_out = Tuple(tags_map[s].args[end] for s in @views(ci.code[end-1].args[2:end]))
 
-    kJVPRules[f] = eval(quote
-        $(gensym(:jvp_rule))(p::Int, t::Int) = Any[$(rule_code...)]
-        # $(Symbol("#", f, :_jvp))(p, t) = (Any[$(rule_code...)], $(sn_out...))
+    eval(quote
+        # $(gensym(:jvp_rule))(p::Int, t::Int) = Any[$(rule_code...)]
+        function jvprule(::Type{typeof($f)}, $(types...))
+            (p::Int, t::Int; o = 0) -> (Any[$(rule_code...)], $(sn_out...))
+        end
     end)
 
     return :nothing
 end
 
 
-new_slot(n) = Expr(:call, SlotNumber, Expr(:call, +, :p, n))
+new_slot(n) = Expr(:call, SlotNumber, Expr(:call, +, n, :o, :p))
 
 
 function transform_rule_stmt(@ns(stmt), id, rn, tags_map; inner = false)
@@ -157,6 +171,19 @@ function transform_rule_stmt(@ns(stmt), id, rn, tags_map; inner = false)
     end
 end
 
+@jvprule  +(x)     true
+@jvprule  +(x, y)  (true, true)
+
+@jvprule  -(x)     -1
+@jvprule  -(x, y)  (true, -1)
+
+@jvprule  *(x)           true
+@jvprule  *(x, y)        (y, x)
+@jvprule  *(x, y, z)     (y * z, x * z, x * y)
+@jvprule  *(w, x, y, z)  (x * y * z, w * y * z, w * x * z, w * x * y)
+
+@jvprule >(x, y)  (NoTangent(), NoTangent())
+@jvprule <(x, y)  (NoTangent(), NoTangent())
 
 @jvprule  one(x)   zero(x)
 @jvprule  zero(x)  (Ω = Ω̇ = zero(x))  replace_primal=true
@@ -232,4 +259,4 @@ end
 @jvprule  log2(x)   inv(x) / log(oftype(x, 2))
 
 
-end  # module ForwardRules
+end  # module JVPRules

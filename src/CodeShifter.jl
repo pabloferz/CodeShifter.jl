@@ -20,7 +20,7 @@ const var"@ns" = var"@nospecialize"
 # Exports
 # =======
 
-export FunTransform, TransformContext, process_inputs, transform!
+export FunTransform, TransformContext, is_primitive, process_inputs, transform!
 
 
 const kCallOnlyPrimitives = Set([
@@ -115,7 +115,7 @@ function transform_generator(
     @ns(ft::Type{FunTransform{T, F}}), @ns(args); show_reference = false
 ) where {T, F}
     SigCtx = T === Tuple{} ? BaseContext : last(T.parameters)
-    sig = signature(BaseContext, F, args...)
+    sig = signature(SigCtx, F, args...)
     methods = Base._methods_by_ftype(sig, -1, typemax(UInt))
     match = only(methods)
 
@@ -131,7 +131,7 @@ function transform_generator(
     code = Any[]
     nargs = length(sig.parameters)
     for ctx in prune_contexts(T === Tuple ? Core.svec() : T.parameters)
-        ci, code, nargs = transform!(ctx, ci, code, mi.def, nargs, match.sparams)
+        ci, code, nargs = transform!(ctx, ci, code, sig, mi.def, nargs, match.sparams)
     end
 
     return ci
@@ -142,13 +142,13 @@ function prune_contexts(list)
     return (BaseContext(), (list[i]() for i = revinds if list[i] !== BaseContext)...)
 end
 
-function transform!(::BaseContext, ci, code, meth, nargs, sparams)
+function transform!(::BaseContext, ci, code, sig, meth, nargs, sparams)
     empty!(code)
     ssa_mapping = Int[]
 
     if meth.isva
-        pushfirst!(code, mkarg(Base.rest, 2, meth.nargs, meth.nargs - 1))
-        prepend!(code, (mkarg(getfield, 2, meth.nargs, i) for i = 1:meth.nargs-2))
+        pushfirst!(code, mkarg(Base.rest, 2, 2, meth.nargs - 1))
+        prepend!(code, (mkarg(getfield, 2, 2, i) for i = 1:meth.nargs-2))
         nargs = meth.nargs
     else
         prepend!(code, (mkarg(getfield, 2, nargs, i) for i = 1:nargs-1))
@@ -162,7 +162,7 @@ function transform!(::BaseContext, ci, code, meth, nargs, sparams)
     for (id, stmt) in enumerate(ci.code)
         stmt = transform_stmt(stmt, id, tags_map, sparams)
         push!(ssa_mapping, id + offset)
-        if (stmt isa NewvarNode || stmt isa SlotNumber)
+        if (stmt isa NewvarNode || stmt isa SlotNumber || stmt === nothing)
             offset -= 1
             continue
         end
@@ -178,15 +178,16 @@ function transform!(::BaseContext, ci, code, meth, nargs, sparams)
     local_slots = maximum(sn.id for sn in values(tags_map) if sn isa SlotNumber) - nargs
     ci.slotnames = Symbol[
         Symbol("#self#"), :args,
-        (Symbol(:a, i) for i = 1:nargs-2)...,
+        (Symbol(:a, i) for i = 1:nargs-1)...,
         (Symbol(:v, i) for i = 1:local_slots)...,
     ]
     ci.slotflags = UInt8[
         0x00, 0x00,
-        (0x00 for i = 1:nargs-2)...,
-        (0x08 for i = 1:local_slots)...,
+        (0x18 for i = 1:nargs-1)...,
+        (0x18 for i = 1:local_slots)...,
     ]
-    ci.slottypes = Any[FunTransform, Any]
+    slottypes = Base.tail((sig.parameters...,))
+    ci.slottypes = Any[FunTransform, Tuple{slottypes...}, slottypes...]
     ci.ssavaluetypes = length(code)
     append!(ci.codelocs, (0 for i = 1:length(code)))
     ci.code, code = code, ci.code
@@ -239,9 +240,13 @@ function transform_stmt(@ns(stmt), id, tags_map, sparams; inner = false)
 end
 
 function push_tag!(tags_map, key)
-    sn = SlotNumber(maximum(sn.id for sn in values(tags_map) if sn isa SlotNumber) + 1)
+    sn = next_slot(tags_map)
     tags_map[key] = sn
     return sn
+end
+
+function next_slot(tags_map)
+    return SlotNumber(maximum(sn.id for sn in values(tags_map) if sn isa SlotNumber) + 1)
 end
 
 function __init__()
