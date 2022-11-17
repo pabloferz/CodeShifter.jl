@@ -18,6 +18,8 @@ import .CodeShifter:
     is_primitive, mkarg, next_slot, process_inputs, transform!, transform_stmt
 import .JVPRules: kInactivePrimitives, kJVPRules
 
+export jvp
+
 
 # Type definitions
 # ================

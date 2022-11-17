@@ -20,7 +20,7 @@ const var"@ns" = var"@nospecialize"
 # Exports
 # =======
 
-export FunTransform, TransformContext, is_primitive, process_inputs, transform!
+export FunTransform, TransformContext, code_shifted, is_primitive, process_inputs, transform!
 
 
 const kCallOnlyPrimitives = Set([
@@ -270,6 +270,11 @@ end
 
 # Utils
 # =====
+
+# Similar to `jax.make_jaxpr`
+code_shifted(f) = (
+    (args...) -> transform_code_info(FunTransform(f), map(Core.Typeof, args)...)
+)
 
 _parameters(::Type{T}) where {T} = (T,)
 _parameters(::Type{T}) where {T <: Tuple} = T.parameters
